@@ -36,13 +36,13 @@ fs.readFile("existingFileIDs.txt", "utf8", (err, data) => {
   existing_file_ids = data.trim().split("\n");
 });
 
-fs.readFile("threadId.txt", "utf8", (err, data) => {
-  if (err) {
-    console.error("Dosya okuma hatası:", err);
-    return;
-  }
-  threadId = data.trim();
-});
+// fs.readFile("threadId.txt", "utf8", (err, data) => {
+//   if (err) {
+//     console.error("Dosya okuma hatası:", err);
+//     return;
+//   }
+//   threadId = data.trim();
+// });
 
 
 
@@ -66,12 +66,12 @@ client.once("ready", async () => {
   }
   
   
-  if (!threadId) {
-    const thread = await openai.beta.threads.create();
-    threadId = thread.id;
-    fs.writeFileSync("threadId.txt",threadId)
-    console.log("New thread created with ID:", threadId);
-  }
+  // if (!threadId) {
+  //   const thread = await openai.beta.threads.create();
+  //   threadId = thread.id;
+  //   fs.writeFileSync("threadId.txt",threadId)
+  //   console.log("New thread created with ID:", threadId);
+  // }
 
   const uploadSlash = new SlashCommandBuilder()
     .setName("upload")
@@ -90,11 +90,19 @@ client.once("ready", async () => {
     .setName("ask")
     .setDescription("ask a question")
     .addStringOption((option) =>
+    option
+      .setName("name")
+      .setDescription("input a name")
+      .setRequired(true)
+      .setAutocomplete(true)
+    )
+    .addStringOption((option) =>
       option
         .setName("question")
         .setDescription("input your question ")
         .setRequired(true)
-    );
+    )
+    ;
 
   client.application.commands
     .create(uploadSlash.toJSON())
@@ -108,10 +116,30 @@ client.once("ready", async () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isCommand()) return;
+  if (!(interaction.isCommand() || interaction.isAutocomplete())) return;
 
   const { commandName, options } = interaction;
 
+  if (interaction.isAutocomplete()) {
+    if (commandName === "ask") {
+      const focusedOption = options.getFocused();
+
+      let choices = [];
+      books.forEach(book=>choices.push(book.name))
+      
+      const filtered = choices.filter((choice) => {
+        const normalizedChoice = choice.trim().toLowerCase();
+        const normalizedFocusedOption = focusedOption.trim().toLowerCase();
+        return normalizedChoice.startsWith(normalizedFocusedOption);
+      });
+
+      const responseChoices = filtered
+        .slice(0, 25) 
+        .map((choice) => ({ name: choice, value: choice }));
+
+      await interaction.respond(responseChoices, { ephemeral: true });
+    }
+  }
   if (commandName === "upload") {
     await uploadHandler(interaction, options);
   }
@@ -121,20 +149,36 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 const uploadHandler = async (interaction, options) => {
+
+  
   const file = options.getAttachment("file");
   const name = options.getString("name");
-  if (!file) {
-    return interaction.reply({
-      content: "Add a file!",
-      ephemeral: true,
+
+await interaction.deferReply({ ephemeral: true });
+
+if (!file) {
+    await interaction.editReply({
+        content: "Bir dosya ekleyin!",
+        ephemeral: true,
     });
-  }
-  if (file.contentType.split("/")[1] != "pdf") {
-    return interaction.reply({
-      content: "Upload a file in pdf format!",
-      ephemeral: true,
+    return;
+}
+
+if (file.contentType.split("/")[1] !== "pdf") {
+    await interaction.editReply({
+        content: "PDF formatında bir dosya yükleyin!",
+        ephemeral: true,
     });
-  }
+    return;
+}
+
+if (books.some(book => book.name.toLowerCase() === name.toLowerCase())) {
+    await interaction.editReply({
+        content: "Lütfen farklı bir isim girin!",
+        ephemeral: true,
+    });
+    return;
+}
 
 
   console.log("PDF is being uploaded to OpenAI...");
@@ -161,23 +205,39 @@ const uploadHandler = async (interaction, options) => {
 
   existing_file_ids.push(openAiFile.id);
   fs.writeFileSync("existingFileIDs.txt", existing_file_ids.join("\n"));
+  
+  const thread = await openai.beta.threads.create();
 
-  const book = new Book(name, file);
+
+  const book = new Book(thread.id,name,openAiFile.id);
   books.push(book);
   saveToJsonFile(books, "books.json");
 
-  await interaction.reply({
+  await interaction.editReply({
     content: `PDF uploaded successfully. : ${file.name}`,
     ephemeral: true,
   });
 };
 
 const askQuestionHandler = async (interaction, options) => {
+  const name = options.getString("name");
   const question = options.getString("question");
 
   await interaction.deferReply({ ephemeral: true });
 
-  var response = await answerQuestion(question);
+  let matchedBook = books.find(book => book.name.toLowerCase() === name.toLowerCase());
+
+  if (!matchedBook) {
+    await interaction.editReply({ content: `There is any book with the name "${name}" `, ephemeral: true });
+    return;
+  } 
+    
+  console.log("threadId atanıyor")
+  threadId = matchedBook.threadId;
+  console.log( `threadID : ${threadId}`)
+  
+
+  var response = await answerQuestion(question,threadId);
 
   const embed = new EmbedBuilder()
     .setColor(0x0099ff)
@@ -226,7 +286,7 @@ fs.readFile("assistant_id.txt", "utf8", (err, data) => {
 const createOrUpdateAssistant = async (openAiFile) => {
   if (assistantId) {
     await openai.beta.assistants.update(assistantId, {
-      file_ids: [...existing_file_ids, openAiFile.id],
+      file_ids: [openAiFile.id],
     });
     console.log("Assistant updated:", assistant);
   } else {
@@ -237,7 +297,7 @@ const createOrUpdateAssistant = async (openAiFile) => {
   }
 };
 
-const answerQuestion = async (question) => {
+const answerQuestion = async (question,threadId) => {
   let answer;
   const message = await openai.beta.threads.messages.create(threadId, {
     role: "user",
